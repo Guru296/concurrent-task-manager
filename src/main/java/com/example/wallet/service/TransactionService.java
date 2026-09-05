@@ -3,6 +3,8 @@ package com.example.wallet.service;
 import com.example.wallet.dto.TransactionRequest;
 import com.example.wallet.entity.TransactionRecord;
 import com.example.wallet.entity.Wallet;
+import com.example.wallet.exception.DuplicateTransactionException;
+import com.example.wallet.exception.InsufficientFundsException;
 import com.example.wallet.repository.TransactionRecordRepository;
 import com.example.wallet.repository.WalletRepository;
 import lombok.RequiredArgsConstructor;
@@ -19,24 +21,27 @@ public class TransactionService {
     @Transactional
     public void processTransaction(TransactionRequest request) {
         
-        // --- NOT CONCURRENCY SAFE YET ---
-        // 1. Finding wallet without any pessimistic locking
-        Wallet wallet = walletRepository.findById(request.getUserId())
-                .orElseThrow(() -> new IllegalArgumentException("Wallet not found for userId: " + request.getUserId()));
+        // 1. Acquire Pessimistic Lock on the Wallet to serialize concurrent requests for the same user
+        Wallet wallet = walletRepository.findLockedByUserId(request.getUserId())
+                .orElseThrow(() -> new com.example.wallet.exception.WalletNotFoundException("Wallet not found for userId: " + request.getUserId()));
 
-        // --- NOT CONCURRENCY SAFE YET ---
-        // 2. Checking balance in a concurrent environment could lead to a race condition
-        if (wallet.getBalance().compareTo(request.getAmount()) < 0) {
-            throw new IllegalArgumentException("Insufficient funds in wallet");
+        // 2. Check Idempotency *after* acquiring the lock
+        if (transactionRecordRepository.existsById(request.getTransactionId())) {
+            throw new DuplicateTransactionException("Transaction " + request.getTransactionId() + " already processed");
         }
 
-        // 3. Deduct amount
+        // 3. Safe Balance Check (we own the lock, no one else can modify this balance right now)
+        if (wallet.getBalance().compareTo(request.getAmount()) < 0) {
+            throw new InsufficientFundsException("Insufficient funds in wallet");
+        }
+
+        // 4. Deduct amount
         wallet.setBalance(wallet.getBalance().subtract(request.getAmount()));
 
-        // 4. Save updated wallet
+        // 5. Save updated wallet
         walletRepository.save(wallet);
 
-        // 5. Save transaction record
+        // 6. Save transaction record to finalize the idempotency key
         TransactionRecord record = new TransactionRecord(
                 request.getTransactionId(),
                 request.getUserId(),
